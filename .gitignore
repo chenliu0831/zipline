@@ -58,3 +58,5 @@ benchmarks.db
 
 # Vagrant temp folder
 .vagrant
+
+/venv/
