@@ -26,7 +26,13 @@ from numbers import Integral
 
 import pandas as pd
 
-from zipline.utils.data import RollingPanel
+from six import (
+    string_types,
+    itervalues,
+    iteritems
+)
+
+from zipline.utils.data import MutableIndexRollingPanel
 from zipline.protocol import Event
 
 from zipline.finance import trading
@@ -187,7 +193,7 @@ class BatchTransform(object):
         # enter the batch transform's window IFF a sid filter is not
         # specified.
         if sids is not None:
-            if isinstance(sids, (basestring, Integral)):
+            if isinstance(sids, (string_types, Integral)):
                 self.static_sids = set([sids])
             else:
                 self.static_sids = set(sids)
@@ -195,7 +201,7 @@ class BatchTransform(object):
             self.static_sids = None
 
         self.initial_field_names = fields
-        if isinstance(self.initial_field_names, basestring):
+        if isinstance(self.initial_field_names, string_types):
             self.initial_field_names = [self.initial_field_names]
         self.field_names = set()
 
@@ -230,7 +236,7 @@ class BatchTransform(object):
         Point of entry. Process an event frame.
         """
         # extract dates
-        dts = [event.datetime for event in data.itervalues()]
+        dts = [event.dt for event in itervalues(data._data)]
         # we have to provide the event with a dt. This is only for
         # checking if the event is outside the window or not so a
         # couple of seconds shouldn't matter. We don't add it to
@@ -238,7 +244,7 @@ class BatchTransform(object):
         # sid keys.
         event = Event()
         event.dt = max(dts)
-        event.data = {k: v.__dict__ for k, v in data.iteritems()
+        event.data = {k: v.__dict__ for k, v in iteritems(data._data)
                       # Need to check if data has a 'length' to filter
                       # out sids without trade data available.
                       # TODO: expose more of 'no trade available'
@@ -259,15 +265,23 @@ class BatchTransform(object):
 
     def _init_panels(self, sids):
         if self.downsample:
-            self.rolling_panel = RollingPanel(self.bars_in_day,
-                                              self.field_names, sids)
+            self.rolling_panel = MutableIndexRollingPanel(
+                self.bars_in_day,
+                self.field_names,
+                sids,
+            )
 
-            self.daily_rolling_panel = RollingPanel(self.window_length,
-                                                    self.field_names, sids)
+            self.daily_rolling_panel = MutableIndexRollingPanel(
+                self.window_length,
+                self.field_names,
+                sids,
+            )
         else:
-            self.rolling_panel = RollingPanel(self.window_length *
-                                              self.bars_in_day,
-                                              self.field_names, sids)
+            self.rolling_panel = MutableIndexRollingPanel(
+                self.window_length * self.bars_in_day,
+                self.field_names,
+                sids,
+            )
 
     def _append_to_window(self, event):
         self.field_names = self._get_field_names(event)
@@ -336,7 +350,7 @@ class BatchTransform(object):
         if self.refresh_period == 0:
             period_signals_update = True
         else:
-        # 1. Is the refresh period over?
+            # 1. Is the refresh period over?
             period_signals_update = (
                 self.trading_days_total % self.refresh_period == 0)
         # 2. Have the args or kwargs been changed since last time?
@@ -375,7 +389,7 @@ class BatchTransform(object):
         else:
             data = self.rolling_panel.get_current()
 
-        if self.supplemental_data:
+        if self.supplemental_data is not None:
             for item in data.items:
                 if item not in self.supplemental_data.items:
                     continue
@@ -419,7 +433,7 @@ class BatchTransform(object):
         # extract field names from sids (price, volume etc), make sure
         # every sid has the same fields.
         sid_keys = []
-        for sid in event.data.itervalues():
+        for sid in itervalues(event.data):
             keys = set([name for name, value in sid.items()
                         if isinstance(value,
                                       (int,
@@ -433,8 +447,7 @@ class BatchTransform(object):
         # with CUSTOM data events, there may be different fields
         # per sid. So the allowable keys are the union of all events.
         union = set.union(*sid_keys)
-        unwanted_fields = set(['portfolio', 'sid', 'dt', 'type',
-                               'datetime', 'source_id'])
+        unwanted_fields = set(['portfolio', 'sid', 'dt', 'type', 'source_id'])
         return union - unwanted_fields
 
     def _get_field_names(self, event):

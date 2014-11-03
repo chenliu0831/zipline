@@ -63,12 +63,12 @@ class TestEventsThroughRisk(unittest.TestCase):
         sim_params = SimulationParameters(
             period_start=start_date,
             period_end=end_date,
+            data_frequency='daily',
             emission_rate='daily'
         )
 
         algo = BuyAndHoldAlgorithm(
-            sim_params=sim_params,
-            data_frequency='daily')
+            sim_params=sim_params)
 
         first_date = datetime.datetime(2006, 1, 3, tzinfo=pytz.utc)
         second_date = datetime.datetime(2006, 1, 4, tzinfo=pytz.utc)
@@ -128,7 +128,7 @@ class TestEventsThroughRisk(unittest.TestCase):
         ]
 
         algo.benchmark_return_source = benchmark_data
-        algo.sources = list([trade_bar_data])
+        algo.set_sources(list([trade_bar_data]))
         gen = algo._create_generator(sim_params)
 
         # TODO: Hand derive these results.
@@ -145,8 +145,8 @@ class TestEventsThroughRisk(unittest.TestCase):
         #       at least be an early warning against changes.
         expected_sharpe = {
             first_date: np.nan,
-            second_date: -31.56903265,
-            third_date: -11.459888981,
+            second_date: -22.322677,
+            third_date: -9.353741
         }
 
         for bar in gen:
@@ -188,8 +188,7 @@ class TestEventsThroughRisk(unittest.TestCase):
                 data_frequency='minute')
 
             algo = BuyAndHoldAlgorithm(
-                sim_params=sim_params,
-                data_frequency='minute')
+                sim_params=sim_params)
 
             first_date = datetime.datetime(2006, 1, 3, tzinfo=pytz.utc)
             first_open, first_close = \
@@ -288,12 +287,12 @@ class TestEventsThroughRisk(unittest.TestCase):
             ]
 
             algo.benchmark_return_source = benchmark_data
-            algo.sources = list([trade_bar_data])
+            algo.set_sources(list([trade_bar_data]))
             gen = algo._create_generator(sim_params)
 
             crm = algo.perf_tracker.cumulative_risk_metrics
 
-            first_msg = gen.next()
+            first_msg = next(gen)
 
             self.assertIsNotNone(first_msg,
                                  "There should be a message emitted.")
@@ -310,7 +309,7 @@ class TestEventsThroughRisk(unittest.TestCase):
                 crm.metrics.algorithm_volatility[algo.datetime.date()],
                 "On the first day algorithm volatility does not exist.")
 
-            second_msg = gen.next()
+            second_msg = next(gen)
 
             self.assertIsNotNone(second_msg, "There should be a message "
                                  "emitted.")
@@ -325,7 +324,7 @@ class TestEventsThroughRisk(unittest.TestCase):
                 crm.algorithm_returns[-1],
                 decimal=6)
 
-            third_msg = gen.next()
+            third_msg = next(gen)
 
             self.assertEqual(1, len(algo.portfolio.positions),
                              "Number of positions should stay the same.")

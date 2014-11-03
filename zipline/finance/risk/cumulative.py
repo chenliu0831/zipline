@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,10 +24,15 @@ import zipline.utils.math_utils as zp_math
 import pandas as pd
 from pandas.tseries.tools import normalize_date
 
+from six import iteritems
+
 from . risk import (
     alpha,
     check_entry,
     choose_treasury,
+    downside_risk,
+    sharpe_ratio,
+    sortino_ratio,
 )
 
 log = logbook.Logger('Risk Cumulative')
@@ -35,54 +40,6 @@ log = logbook.Logger('Risk Cumulative')
 
 choose_treasury = functools.partial(choose_treasury, lambda *args: '10year',
                                     compound=False)
-
-
-def sharpe_ratio(algorithm_volatility, annualized_return, treasury_return):
-    """
-    http://en.wikipedia.org/wiki/Sharpe_ratio
-
-    Args:
-        algorithm_volatility (float): Algorithm volatility.
-        algorithm_return (float): Algorithm return percentage.
-        treasury_return (float): Treasury return percentage.
-
-    Returns:
-        float. The Sharpe ratio.
-    """
-    if zp_math.tolerant_equals(algorithm_volatility, 0):
-        return np.nan
-
-    return (
-        (annualized_return - treasury_return)
-        # The square of the annualization factor is in the volatility,
-        # because the volatility is also annualized,
-        # i.e. the sqrt(annual factor) is in the volatility's numerator.
-        # So to have the the correct annualization factor for the
-        # Sharpe value's numerator, which should be the sqrt(annual factor).
-        # The square of the sqrt of the annual factor, i.e. the annual factor
-        # itself, is needed in the numerator to factor out the division by
-        # its square root.
-        / algorithm_volatility)
-
-
-def sortino_ratio(annualized_algorithm_return, treasury_return, downside_risk):
-    """
-    http://en.wikipedia.org/wiki/Sortino_ratio
-
-    Args:
-        algorithm_returns (np.array-like):
-            Returns from algorithm lifetime.
-        algorithm_period_return (float):
-            Algorithm return percentage from latest period.
-        mar (float): Minimum acceptable return.
-
-    Returns:
-        float. The Sortino ratio.
-    """
-    if np.isnan(downside_risk) or zp_math.tolerant_equals(downside_risk, 0):
-        return 0.0
-
-    return (annualized_algorithm_return - treasury_return) / downside_risk
 
 
 def information_ratio(algo_volatility, algorithm_return, benchmark_return):
@@ -153,6 +110,12 @@ class RiskMetricsCumulative(object):
             self.start_date,
             self.end_date)
 
+        # Hold on to the trading day before the start,
+        # used for index of the zero return value when forcing returns
+        # on the first day.
+        self.day_before_start = self.start_date - \
+            trading.environment.trading_days.freq
+
         last_day = normalize_date(sim_params.period_end)
         if last_day not in self.trading_days:
             last_day = pd.tseries.index.DatetimeIndex(
@@ -178,6 +141,11 @@ class RiskMetricsCumulative(object):
 
         self.algorithm_returns_cont = pd.Series(index=cont_index)
         self.benchmark_returns_cont = pd.Series(index=cont_index)
+        self.mean_returns_cont = pd.Series(index=cont_index)
+        self.annualized_mean_returns_cont = pd.Series(index=cont_index)
+        self.mean_benchmark_returns_cont = pd.Series(index=cont_index)
+        self.annualized_mean_benchmark_returns_cont = pd.Series(
+            index=cont_index)
 
         # The returns at a given time are read and reset from the respective
         # returns container.
@@ -186,11 +154,10 @@ class RiskMetricsCumulative(object):
         self.mean_returns = None
         self.annualized_mean_returns = None
         self.mean_benchmark_returns = None
-        self.annualized_benchmark_returns = None
+        self.annualized_mean_benchmark_returns = None
 
-        self.compounded_log_returns = pd.Series(index=cont_index)
-        self.algorithm_period_returns = pd.Series(index=cont_index)
-        self.benchmark_period_returns = pd.Series(index=cont_index)
+        self.algorithm_cumulative_returns = pd.Series(index=cont_index)
+        self.benchmark_cumulative_returns = pd.Series(index=cont_index)
         self.excess_returns = pd.Series(index=cont_index)
 
         self.latest_dt = cont_index[0]
@@ -198,9 +165,14 @@ class RiskMetricsCumulative(object):
         self.metrics = pd.DataFrame(index=cont_index,
                                     columns=self.METRIC_NAMES)
 
+        self.drawdowns = pd.Series(index=cont_index)
+        self.max_drawdowns = pd.Series(index=cont_index)
         self.max_drawdown = 0
         self.current_max = -np.inf
         self.daily_treasury = pd.Series(index=self.trading_days)
+        self.treasury_period_return = np.nan
+
+        self.num_trading_days = 0
 
     def get_minute_index(self, sim_params):
         """
@@ -226,49 +198,65 @@ class RiskMetricsCumulative(object):
         self.latest_dt = dt
 
         self.algorithm_returns_cont[dt] = algorithm_returns
-        self.algorithm_returns = self.algorithm_returns_cont.valid()
+        self.algorithm_returns = self.algorithm_returns_cont[:dt]
+
+        self.num_trading_days = len(self.algorithm_returns)
 
         if self.create_first_day_stats:
             if len(self.algorithm_returns) == 1:
                 self.algorithm_returns = pd.Series(
-                    {'null return': 0.0}).append(self.algorithm_returns)
+                    {self.day_before_start: 0.0}).append(
+                    self.algorithm_returns)
 
-        self.mean_returns = pd.rolling_mean(self.algorithm_returns,
-                                            window=len(self.algorithm_returns),
-                                            min_periods=1)
+        self.algorithm_cumulative_returns[dt] = \
+            self.calculate_cumulative_returns(self.algorithm_returns)
 
-        self.annualized_mean_returns = self.mean_returns * 252
+        algo_cumulative_returns_to_date = \
+            self.algorithm_cumulative_returns[:dt]
+
+        self.mean_returns_cont[dt] = \
+            algo_cumulative_returns_to_date[dt] / self.num_trading_days
+
+        self.mean_returns = self.mean_returns_cont[:dt]
+
+        self.annualized_mean_returns_cont[dt] = \
+            self.mean_returns_cont[dt] * 252
+
+        self.annualized_mean_returns = self.annualized_mean_returns_cont[:dt]
+
+        if self.create_first_day_stats:
+            if len(self.mean_returns) == 1:
+                self.mean_returns = pd.Series(
+                    {self.day_before_start: 0.0}).append(self.mean_returns)
+                self.annualized_mean_returns = pd.Series(
+                    {self.day_before_start: 0.0}).append(
+                    self.annualized_mean_returns)
 
         self.benchmark_returns_cont[dt] = benchmark_returns
-        self.benchmark_returns = self.benchmark_returns_cont.valid()
-
-        self.mean_benchmark_returns = pd.rolling_mean(
-            self.benchmark_returns,
-            window=len(self.benchmark_returns),
-            min_periods=1)
-
-        self.annualized_benchmark_returns = self.mean_benchmark_returns * 252
+        self.benchmark_returns = self.benchmark_returns_cont[:dt]
 
         if self.create_first_day_stats:
             if len(self.benchmark_returns) == 1:
                 self.benchmark_returns = pd.Series(
-                    {'null return': 0.0}).append(self.benchmark_returns)
+                    {self.day_before_start: 0.0}).append(
+                    self.benchmark_returns)
 
-        self.mean_benchmark_returns = pd.rolling_mean(
-            self.benchmark_returns,
-            window=len(self.benchmark_returns),
-            min_periods=1)
+        self.benchmark_cumulative_returns[dt] = \
+            self.calculate_cumulative_returns(self.benchmark_returns)
 
-        self.annualized_benchmark_returns = self.mean_benchmark_returns * 252
+        benchmark_cumulative_returns_to_date = \
+            self.benchmark_cumulative_returns[:dt]
 
-        self.num_trading_days = len(self.algorithm_returns)
+        self.mean_benchmark_returns_cont[dt] = \
+            benchmark_cumulative_returns_to_date[dt] / self.num_trading_days
 
-        self.update_compounded_log_returns()
+        self.mean_benchmark_returns = self.mean_benchmark_returns_cont[:dt]
 
-        self.algorithm_period_returns[dt] = \
-            self.calculate_period_returns(self.algorithm_returns)
-        self.benchmark_period_returns[dt] = \
-            self.calculate_period_returns(self.benchmark_returns)
+        self.annualized_mean_benchmark_returns_cont[dt] = \
+            self.mean_benchmark_returns_cont[dt] * 252
+
+        self.annualized_mean_benchmark_returns = \
+            self.annualized_mean_benchmark_returns_cont[:dt]
 
         if not self.algorithm_returns.index.equals(
             self.benchmark_returns.index
@@ -301,34 +289,20 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
                 self.start_date,
                 treasury_end
             )
-            self.daily_treasury[treasury_end] =\
-                treasury_period_return
-        self.treasury_period_return = \
-            self.daily_treasury[treasury_end]
+            self.daily_treasury[treasury_end] = treasury_period_return
+        self.treasury_period_return = self.daily_treasury[treasury_end]
         self.excess_returns[self.latest_dt] = (
-            self.algorithm_period_returns[self.latest_dt]
+            self.algorithm_cumulative_returns[self.latest_dt]
             -
             self.treasury_period_return)
         self.metrics.beta[dt] = self.calculate_beta()
-        self.metrics.alpha[dt] = self.calculate_alpha(dt)
+        self.metrics.alpha[dt] = self.calculate_alpha()
         self.metrics.sharpe[dt] = self.calculate_sharpe()
         self.metrics.downside_risk[dt] = self.calculate_downside_risk()
         self.metrics.sortino[dt] = self.calculate_sortino()
         self.metrics.information[dt] = self.calculate_information()
         self.max_drawdown = self.calculate_max_drawdown()
-
-        if self.create_first_day_stats:
-            # Remove placeholder 0 return
-            if 'null return' in self.algorithm_returns:
-                self.algorithm_returns = self.algorithm_returns.drop(
-                    'null return')
-                self.algorithm_returns.index = pd.to_datetime(
-                    self.algorithm_returns.index)
-            if 'null return' in self.benchmark_returns:
-                self.benchmark_returns = self.benchmark_returns.drop(
-                    'null return')
-                self.benchmark_returns.index = pd.to_datetime(
-                    self.benchmark_returns.index)
+        self.max_drawdowns[dt] = self.max_drawdown
 
     def to_dict(self):
         """
@@ -338,50 +312,33 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         dt = self.latest_dt
         period_label = dt.strftime("%Y-%m")
         rval = {
-            'trading_days': len(self.algorithm_returns.valid()),
-            'benchmark_volatility':
-            self.metrics.benchmark_volatility[dt],
-            'algo_volatility':
-            self.metrics.algorithm_volatility[dt],
+            'trading_days': self.num_trading_days,
+            'benchmark_volatility': self.metrics.benchmark_volatility[dt],
+            'algo_volatility': self.metrics.algorithm_volatility[dt],
             'treasury_period_return': self.treasury_period_return,
-            'algorithm_period_return': self.algorithm_period_returns[dt],
-            'benchmark_period_return': self.benchmark_period_returns[dt],
+            # Though the two following keys say period return,
+            # they would be more accurately called the cumulative return.
+            # However, the keys need to stay the same, for now, for backwards
+            # compatibility with existing consumers.
+            'algorithm_period_return': self.algorithm_cumulative_returns[dt],
+            'benchmark_period_return': self.benchmark_cumulative_returns[dt],
             'beta': self.metrics.beta[dt],
             'alpha': self.metrics.alpha[dt],
+            'sharpe': self.metrics.sharpe[dt],
+            'sortino': self.metrics.sortino[dt],
+            'information': self.metrics.information[dt],
             'excess_return': self.excess_returns[dt],
             'max_drawdown': self.max_drawdown,
             'period_label': period_label
         }
 
-        rval['sharpe'] = self.metrics.sharpe[dt]
-        rval['sortino'] = self.metrics.sortino[dt]
-        rval['information'] = self.metrics.information[dt]
-
-        return {k: None
-                if check_entry(k, v)
-                else v for k, v in rval.iteritems()}
+        return {k: (None if check_entry(k, v) else v)
+                for k, v in iteritems(rval)}
 
     def __repr__(self):
         statements = []
-        metrics = [
-            "algorithm_period_returns",
-            "benchmark_period_returns",
-            "excess_returns",
-            "trading_days",
-            "benchmark_volatility",
-            "algorithm_volatility",
-            "sharpe",
-            "sortino",
-            "information",
-            "beta",
-            "alpha",
-            "max_drawdown",
-            "algorithm_returns",
-            "benchmark_returns",
-        ]
-
-        for metric in metrics:
-            value = getattr(self, metric)
+        for metric in self.METRIC_NAMES:
+            value = getattr(self.metrics, metric)[-1]
             if isinstance(value, list):
                 if len(value) == 0:
                     value = np.nan
@@ -391,39 +348,34 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
 
         return '\n'.join(statements)
 
-    def update_compounded_log_returns(self):
-        if len(self.algorithm_returns) == 0:
-            return
-
-        try:
-            compound = math.log(1 + self.algorithm_returns[
-                self.algorithm_returns.last_valid_index()])
-        except ValueError:
-            compound = 0.0
-            # BUG? Shouldn't this be set to log(1.0 + 0) ?
-
-        if np.isnan(self.compounded_log_returns[self.latest_dt]):
-            self.compounded_log_returns[self.latest_dt] = compound
-        else:
-            self.compounded_log_returns[self.latest_dt] = \
-                self.compounded_log_returns[self.latest_dt] + compound
-
-    def calculate_period_returns(self, returns):
+    def calculate_cumulative_returns(self, returns):
         return (1. + returns).prod() - 1
 
     def update_current_max(self):
-        if len(self.compounded_log_returns) == 0:
+        if len(self.algorithm_cumulative_returns) == 0:
             return
-        if self.current_max < self.compounded_log_returns[self.latest_dt]:
-            self.current_max = self.compounded_log_returns[self.latest_dt]
+        current_cumulative_return = \
+            self.algorithm_cumulative_returns[self.latest_dt]
+        if self.current_max < current_cumulative_return:
+            self.current_max = current_cumulative_return
 
     def calculate_max_drawdown(self):
-        if len(self.compounded_log_returns) == 0:
+        if len(self.algorithm_cumulative_returns) == 0:
             return self.max_drawdown
 
-        cur_drawdown = 1.0 - math.exp(
-            self.compounded_log_returns[self.latest_dt] -
-            self.current_max)
+        # The drawdown is defined as: (high - low) / high
+        # The above factors out to: 1.0 - (low / high)
+        #
+        # Instead of explicitly always using the low, use the current total
+        # return value, and test that against the max drawdown, which will
+        # exceed the previous max_drawdown iff the current return is lower than
+        # the previous low in the current drawdown window.
+        cur_drawdown = 1.0 - (
+            (1.0 + self.algorithm_cumulative_returns[self.latest_dt])
+            /
+            (1.0 + self.current_max))
+
+        self.drawdowns[self.latest_dt] = cur_drawdown
 
         if self.max_drawdown < cur_drawdown:
             return cur_drawdown
@@ -453,25 +405,26 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         return information_ratio(
             self.metrics.algorithm_volatility[self.latest_dt],
             self.annualized_mean_returns[self.latest_dt],
-            self.annualized_benchmark_returns[self.latest_dt])
+            self.annualized_mean_benchmark_returns[self.latest_dt])
 
-    def calculate_alpha(self, dt):
+    def calculate_alpha(self):
         """
         http://en.wikipedia.org/wiki/Alpha_(investment)
         """
         return alpha(self.annualized_mean_returns[self.latest_dt],
                      self.treasury_period_return,
-                     self.annualized_benchmark_returns[self.latest_dt],
-                     self.metrics.beta[dt])
+                     self.annualized_mean_benchmark_returns[self.latest_dt],
+                     self.metrics.beta[self.latest_dt])
 
     def calculate_volatility(self, daily_returns):
-        return np.std(daily_returns) * math.sqrt(252)
+        if len(daily_returns) <= 1:
+            return 0.0
+        return np.std(daily_returns, ddof=1) * math.sqrt(252)
 
     def calculate_downside_risk(self):
-        rets = self.algorithm_returns
-        mar = self.mean_returns
-        downside_diff = (rets[rets < mar] - mar).valid()
-        return np.std(downside_diff) * math.sqrt(252)
+        return downside_risk(self.algorithm_returns,
+                             self.mean_returns,
+                             252)
 
     def calculate_beta(self):
         """
@@ -487,8 +440,8 @@ algorithm_returns ({algo_count}) in range {start} : {end} on {dt}"
         if len(self.annualized_mean_returns) < 2:
             return 0.0
 
-        returns_matrix = np.vstack([self.annualized_mean_returns,
-                                    self.annualized_benchmark_returns])
+        returns_matrix = np.vstack([self.algorithm_returns,
+                                    self.benchmark_returns])
         C = np.cov(returns_matrix, ddof=1)
         algorithm_covariance = C[0][1]
         benchmark_variance = C[1][1]

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 
+import importlib
 import os
 from os.path import expanduser
 from collections import OrderedDict
@@ -25,7 +26,8 @@ import pandas as pd
 from pandas.io.data import DataReader
 import pytz
 
-from . treasuries import get_treasury_data
+from six import iteritems
+
 from . import benchmarks
 from . benchmarks import get_benchmark_returns
 
@@ -49,8 +51,18 @@ CACHE_PATH = os.path.join(
     'cache'
 )
 
+# Mapping from index symbol to appropriate bond data
+INDEX_MAPPING = {
+    '^GSPC':
+    ('treasuries', 'treasury_curves.csv', 'data.treasury.gov'),
+    '^GSPTSE':
+    ('treasuries_can', 'treasury_curves_can.csv', 'bankofcanada.ca'),
+    '^FTSE':  # use US treasuries until UK bonds implemented
+    ('treasuries', 'treasury_curves.csv', 'data.treasury.gov'),
+}
 
-def get_datafile(name, mode='r'):
+
+def get_data_filepath(name):
     """
     Returns a handle to data file.
 
@@ -60,7 +72,7 @@ def get_datafile(name, mode='r'):
     if not os.path.exists(DATA_PATH):
         os.makedirs(DATA_PATH)
 
-    return open(os.path.join(DATA_PATH, name), mode)
+    return os.path.join(DATA_PATH, name)
 
 
 def get_cache_filepath(name):
@@ -70,23 +82,28 @@ def get_cache_filepath(name):
     return os.path.join(CACHE_PATH, name)
 
 
-def dump_treasury_curves():
+def dump_treasury_curves(module='treasuries', filename='treasury_curves.csv'):
     """
     Dumps data to be used with zipline.
 
     Puts source treasury and data into zipline.
     """
+    try:
+        m = importlib.import_module("." + module, package='zipline.data')
+    except ImportError:
+        raise NotImplementedError(
+            'Treasury curve {0} module not implemented'.format(module))
+
     tr_data = {}
 
-    for curve in get_treasury_data():
+    for curve in m.get_treasury_data():
         # Not ideal but massaging data into expected format
         tr_data[curve['date']] = curve
 
     curves = pd.DataFrame(tr_data).T
 
-    datafile = get_datafile('treasury_curves.csv', mode='wb')
-    curves.to_csv(datafile)
-    datafile.close()
+    data_filepath = get_data_filepath(filename)
+    curves.to_csv(data_filepath)
 
     return curves
 
@@ -103,10 +120,9 @@ def dump_benchmarks(symbol):
         benchmark = (daily_return.date, daily_return.returns)
         benchmark_data.append(benchmark)
 
-    datafile = get_datafile(get_benchmark_filename(symbol), mode='wb')
+    data_filepath = get_data_filepath(get_benchmark_filename(symbol))
     benchmark_returns = pd.Series(dict(benchmark_data))
-    benchmark_returns.to_csv(datafile)
-    datafile.close()
+    benchmark_returns.to_csv(data_filepath)
 
 
 def update_benchmarks(symbol, last_date):
@@ -117,9 +133,8 @@ def update_benchmarks(symbol, last_date):
 
     Puts source benchmark into zipline.
     """
-    datafile = get_datafile(get_benchmark_filename(symbol), mode='rb')
+    datafile = get_data_filepath(get_benchmark_filename(symbol))
     saved_benchmarks = pd.Series.from_csv(datafile)
-    datafile.close()
 
     try:
         start = last_date + timedelta(days=1)
@@ -128,9 +143,8 @@ def update_benchmarks(symbol, last_date):
             benchmark = pd.Series({daily_return.date: daily_return.returns})
             saved_benchmarks = saved_benchmarks.append(benchmark)
 
-        datafile = get_datafile(get_benchmark_filename(symbol), mode='wb')
+        datafile = get_data_filepath(get_benchmark_filename(symbol))
         saved_benchmarks.to_csv(datafile)
-        datafile.close()
     except benchmarks.BenchmarkDataNotFoundError as exc:
         logger.warn(exc)
     return saved_benchmarks
@@ -141,19 +155,18 @@ def get_benchmark_filename(symbol):
 
 
 def load_market_data(bm_symbol='^GSPC'):
+    bm_filepath = get_data_filepath(get_benchmark_filename(bm_symbol))
     try:
-        fp_bm = get_datafile(get_benchmark_filename(bm_symbol), "rb")
-    except IOError:
+        saved_benchmarks = pd.Series.from_csv(bm_filepath)
+    except (OSError, IOError):
         print("""
 data files aren't distributed with source.
 Fetching data from Yahoo Finance.
-""").strip()
+""".strip())
         dump_benchmarks(bm_symbol)
-        fp_bm = get_datafile(get_benchmark_filename(bm_symbol), "rb")
+        saved_benchmarks = pd.Series.from_csv(bm_filepath)
 
-    saved_benchmarks = pd.Series.from_csv(fp_bm)
     saved_benchmarks = saved_benchmarks.tz_localize('UTC')
-    fp_bm.close()
 
     most_recent = pd.Timestamp('today', tz='UTC') - trading_day
     most_recent_index = trading_days.searchsorted(most_recent)
@@ -184,17 +197,21 @@ Fetching data from Yahoo Finance.
         ):
             benchmark_returns = benchmark_returns.tz_localize('UTC')
 
+    # Get treasury curve module, filename & source from mapping.
+    # Default to USA.
+    module, filename, source = INDEX_MAPPING.get(
+        bm_symbol, INDEX_MAPPING['^GSPC'])
+
+    tr_filepath = get_data_filepath(filename)
     try:
-        fp_tr = get_datafile('treasury_curves.csv', "rb")
-    except IOError:
+        saved_curves = pd.DataFrame.from_csv(tr_filepath)
+    except (OSError, IOError):
         print("""
 data files aren't distributed with source.
-Fetching data from data.treasury.gov
-""").strip()
-        dump_treasury_curves()
-        fp_tr = get_datafile('treasury_curves.csv', "rb")
-
-    saved_curves = pd.DataFrame.from_csv(fp_tr)
+Fetching data from {0}
+""".format(source).strip())
+        dump_treasury_curves(module, filename)
+        saved_curves = pd.DataFrame.from_csv(tr_filepath)
 
     # Find the offset of the last date for which we have trading data in our
     # list of valid trading days
@@ -205,21 +222,19 @@ Fetching data from data.treasury.gov
     # If more than 1 trading days has elapsed since the last day where
     # we have data,then we need to update
     if len(days_up_to_now) - last_tr_date_offset > 1:
-        treasury_curves = dump_treasury_curves()
+        treasury_curves = dump_treasury_curves(module, filename)
     else:
         treasury_curves = saved_curves.tz_localize('UTC')
 
     tr_curves = {}
-    for tr_dt, curve in treasury_curves.T.iterkv():
+    for tr_dt, curve in treasury_curves.T.iteritems():
         # tr_dt = tr_dt.replace(hour=0, minute=0, second=0, microsecond=0,
         #                       tzinfo=pytz.utc)
         tr_curves[tr_dt] = curve.to_dict()
 
-    fp_tr.close()
-
     tr_curves = OrderedDict(sorted(
-                            ((dt, c) for dt, c in tr_curves.iteritems()),
-                            key=lambda t: t[0]))
+        ((dt, c) for dt, c in iteritems(tr_curves)),
+        key=lambda t: t[0]))
 
     return benchmark_returns, tr_curves
 
@@ -249,14 +264,14 @@ must specify stocks or indexes"""
     if start is None:
         start = pd.datetime(1990, 1, 1, 0, 0, 0, 0, pytz.utc)
 
-    if not start is None and not end is None:
+    if start is not None and end is not None:
         assert start < end, "start date is later than end date."
 
     data = OrderedDict()
 
     if stocks is not None:
         for stock in stocks:
-            print stock
+            print(stock)
             cache_filename = "{stock}-{start}-{end}.csv".format(
                 stock=stock,
                 start=start,
@@ -270,8 +285,8 @@ must specify stocks or indexes"""
             data[stock] = stkd
 
     if indexes is not None:
-        for name, ticker in indexes.iteritems():
-            print name
+        for name, ticker in iteritems(indexes):
+            print(name)
             stkd = DataReader(ticker, 'yahoo', start, end).sort_index()
             data[name] = stkd
 
@@ -306,7 +321,7 @@ def load_from_yahoo(indexes=None,
         close_key = 'Adj Close'
     else:
         close_key = 'Close'
-    df = pd.DataFrame({key: d[close_key] for key, d in data.iteritems()})
+    df = pd.DataFrame({key: d[close_key] for key, d in iteritems(data)})
     df.index = df.index.tz_localize(pytz.utc)
     return df
 

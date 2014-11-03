@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,8 +20,10 @@ import math
 
 from copy import copy
 from functools import partial
+
+from six import with_metaclass
+
 from zipline.protocol import DATASOURCE_TYPE
-import zipline.utils.math_utils as zp_math
 
 SELL = 1 << 0
 BUY = 1 << 1
@@ -95,14 +97,10 @@ def transact_stub(slippage, commission, event, open_orders):
     slippage and commission models can be enclosed.
     """
     for order, transaction in slippage(event, open_orders):
-        if (
-            transaction
-            and not
-            zp_math.tolerant_equals(transaction.amount, 0)
-        ):
+        if transaction and transaction.amount != 0:
             direction = math.copysign(1, transaction.amount)
             per_share, total_commission = commission.calculate(transaction)
-            transaction.price = transaction.price + (per_share * direction)
+            transaction.price += per_share * direction
             transaction.commission = total_commission
         yield order, transaction
 
@@ -152,9 +150,7 @@ def create_transaction(event, order, price, amount):
     return transaction
 
 
-class SlippageModel(object):
-
-    __metaclass__ = abc.ABCMeta
+class SlippageModel(with_metaclass(abc.ABCMeta)):
 
     @property
     def volume_for_bar(self):
@@ -170,7 +166,7 @@ class SlippageModel(object):
 
         for order in current_orders:
 
-            if zp_math.tolerant_equals(order.open_amount, 0):
+            if order.open_amount == 0:
                 continue
 
             order.check_triggers(event)
@@ -230,7 +226,7 @@ class VolumeShareSlippage(SlippageModel):
         volume_share = min(total_volume / event.volume,
                            self.volume_limit)
 
-        simulated_impact = (volume_share) ** 2 \
+        simulated_impact = volume_share ** 2 \
             * math.copysign(self.price_impact, order.direction) \
             * event.price
 

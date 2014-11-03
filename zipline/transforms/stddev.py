@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,19 +16,19 @@
 from collections import defaultdict
 from math import sqrt
 
-from zipline.errors import WrongDataForTransform
+from six import with_metaclass
+
 from zipline.transforms.utils import EventWindow, TransformMeta
 import zipline.utils.math_utils as zp_math
 
 
-class MovingStandardDev(object):
+class MovingStandardDev(with_metaclass(TransformMeta)):
     """
     Class that maintains a dictionary from sids to
     MovingStandardDevWindows.  For each sid, we maintain a the
     standard deviation of all events falling within the specified
     window.
     """
-    __metaclass__ = TransformMeta
 
     def __init__(self, market_aware=True, window_length=None, delta=None):
 
@@ -72,16 +72,6 @@ class MovingStandardDev(object):
         window.update(event)
         return window.get_stddev()
 
-    def assert_required_fields(self, event):
-        """
-        We only allow events with a price field to be run through
-        the returns transform.
-        """
-        if 'price' not in event:
-                raise WrongDataForTransform(
-                    transform="StdDevEventWindow",
-                    fields='price')
-
 
 class MovingStandardDevWindow(EventWindow):
     """
@@ -97,6 +87,10 @@ class MovingStandardDevWindow(EventWindow):
 
         self.sum = 0.0
         self.sum_sqr = 0.0
+
+    @property
+    def fields(self):
+        return ['price']
 
     def handle_add(self, event):
         self.sum += event.price

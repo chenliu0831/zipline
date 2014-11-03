@@ -15,6 +15,8 @@
 
 import heapq
 
+from six.moves import reduce
+
 
 def _decorate_source(source):
     for message in source:
@@ -45,12 +47,3 @@ def sequential_transforms(stream_in, *transforms):
                         stream_in)
 
     return stream_out
-
-
-def alias_dt(stream_in):
-    """
-    Alias the dt field to datetime on each message.
-    """
-    for message in stream_in:
-        message['datetime'] = message['dt']
-        yield message

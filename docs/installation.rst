@@ -23,9 +23,7 @@ Dependencies
 * numpy (>= 1.6.0)
 * pandas (>= 0.9.0)
 * pytz
-* iso8601
 * Logbook
-* blist
 
 
 Develop

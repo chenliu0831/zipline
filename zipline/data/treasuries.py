@@ -21,6 +21,8 @@ import requests
 from collections import OrderedDict
 import xml.etree.ElementTree as ET
 
+from six import iteritems
+
 from . loader_utils import (
     guarded_conversion,
     safe_int,
@@ -58,10 +60,10 @@ _CURVE_MAPPINGS = {
 }
 
 
-def treasury_mappings():
+def treasury_mappings(mappings):
     return {key: Mapping(*value)
             for key, value
-            in _CURVE_MAPPINGS.iteritems()}
+            in iteritems(mappings)}
 
 
 class iter_to_stream(object):
@@ -96,7 +98,7 @@ def get_treasury_source():
 http://data.treasury.gov/feed.svc/DailyTreasuryYieldCurveRateData\
 """
     res = requests.get(url, stream=True)
-    stream = iter_to_stream(res.iter_lines())
+    stream = iter_to_stream(res.text.splitlines())
 
     elements = ET.iterparse(stream, ('end', 'start-ns', 'end-ns'))
 
@@ -117,8 +119,7 @@ http://data.treasury.gov/feed.svc/DailyTreasuryYieldCurveRateData\
             if tag == "entry":
                 properties = element.find(properties_xpath[0])
                 datum = {get_localname(node): node.text
-                         for node in properties.getchildren()
-                         if ET.iselement(node)}
+                         for node in properties if ET.iselement(node)}
                 # clear the element after we've dealt with it:
                 element.clear()
                 yield datum
@@ -133,7 +134,7 @@ http://data.treasury.gov/feed.svc/DailyTreasuryYieldCurveRateData\
 
 
 def get_treasury_data():
-    mappings = treasury_mappings()
+    mappings = treasury_mappings(_CURVE_MAPPINGS)
     source = get_treasury_source()
     return source_to_records(mappings, source)
 

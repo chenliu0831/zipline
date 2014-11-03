@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from copy import copy
+import warnings
 
 import pytz
 import pandas as pd
@@ -20,37 +21,65 @@ import numpy as np
 
 from datetime import datetime
 
-from itertools import groupby, ifilter
+from itertools import groupby, chain
+from six.moves import filter
+from six import iteritems, exec_
 from operator import attrgetter
 
 from zipline.errors import (
-    UnsupportedSlippageModel,
+    OrderDuringInitialize,
+    OverrideCommissionPostInit,
     OverrideSlippagePostInit,
+    RegisterTradingControlPostInit,
     UnsupportedCommissionModel,
-    OverrideCommissionPostInit
+    UnsupportedOrderParameters,
+    UnsupportedSlippageModel,
+    IncompatibleScheduleFunctionDataFrequency,
+)
+
+from zipline.finance import trading
+from zipline.finance.blotter import Blotter
+from zipline.finance.commission import PerShare, PerTrade, PerDollar
+from zipline.finance.controls import (
+    LongOnly,
+    MaxOrderCount,
+    MaxOrderSize,
+    MaxPositionSize,
+)
+from zipline.finance.execution import (
+    LimitOrder,
+    MarketOrder,
+    StopLimitOrder,
+    StopOrder,
 )
 from zipline.finance.performance import PerformanceTracker
-from zipline.sources import DataFrameSource, DataPanelSource
-from zipline.utils.factory import create_simulation_parameters
-from zipline.transforms.utils import StatefulTransform
 from zipline.finance.slippage import (
     VolumeShareSlippage,
     SlippageModel,
     transact_partial
 )
-from zipline.finance.commission import PerShare, PerTrade, PerDollar
-from zipline.finance.blotter import Blotter
-from zipline.finance.constants import ANNUALIZER
-from zipline.finance import trading
-import zipline.protocol
-from zipline.protocol import Event
-
 from zipline.gens.composites import (
     date_sorted_sources,
     sequential_transforms,
-    alias_dt
 )
 from zipline.gens.tradesimulation import AlgorithmSimulator
+from zipline.sources import DataFrameSource, DataPanelSource
+from zipline.transforms.utils import StatefulTransform
+from zipline.utils.api_support import ZiplineAPI, api_method
+import zipline.utils.events
+from zipline.utils.events import (
+    EventManager,
+    make_eventrule,
+    DateRuleFactory,
+    TimeRuleFactory,
+)
+from zipline.utils.factory import create_simulation_parameters
+
+import zipline.protocol
+from zipline.protocol import Event
+
+from zipline.history import HistorySpec
+from zipline.history.history_container import HistoryContainer
 
 DEFAULT_CAPITAL_BASE = float("1.0e5")
 
@@ -62,33 +91,51 @@ class TradingAlgorithm(object):
 
     A new algorithm could look like this:
     ```
-    class MyAlgo(TradingAlgorithm):
-        def initialize(self, sids, amount):
-            self.sids = sids
-            self.amount = amount
+    from zipline.api import order
 
-        def handle_data(self, data):
-            sid = self.sids[0]
-            amount = self.amount
-            self.order(sid, amount)
+    def initialize(context):
+        context.sid = 'AAPL'
+        context.amount = 100
+
+    def handle_data(self, data):
+        sid = context.sid
+        amount = context.amount
+        order(sid, amount)
     ```
-    To then to run this algorithm:
+    To then to run this algorithm pass these functions to
+    TradingAlgorithm:
 
-    my_algo = MyAlgo([0], 100) # first argument has to be list of sids
+    my_algo = TradingAlgorithm(initialize, handle_data)
     stats = my_algo.run(data)
 
     """
+
+    # If this is set to false then it is the responsibility
+    # of the overriding subclass to set initialized = true
+    AUTO_INITIALIZE = True
+
     def __init__(self, *args, **kwargs):
         """Initialize sids and other state variables.
 
         :Arguments:
+        :Optional:
+            initialize : function
+                Function that is called with a single
+                argument at the begninning of the simulation.
+            handle_data : function
+                Function that is called with 2 arguments
+                (context and data) on every bar.
+            script : str
+                Algoscript that contains initialize and
+                handle_data function definition.
             data_frequency : str (daily, hourly or minutely)
                The duration of the bars.
-            annualizer : int <optional>
-               Which constant to use for annualizing risk metrics.
-               If not provided, will extract from data_frequency.
             capital_base : float <default: 1.0e5>
                How much capital to start with.
+            instant_fill : bool <default: False>
+               Whether to fill orders immediately or on next bar.
+            environment : str <default: 'zipline'>
+               The environment that this algorithm is running in.
         """
         self.datetime = None
 
@@ -96,49 +143,132 @@ class TradingAlgorithm(object):
         self.transforms = []
         self.sources = []
 
+        # List of trading controls to be used to validate orders.
+        self.trading_controls = []
+
         self._recorded_vars = {}
+        self.namespace = kwargs.get('namespace', {})
+
+        self._environment = kwargs.pop('environment', 'zipline')
 
         self.logger = None
 
         self.benchmark_return_source = None
-        self.perf_tracker = None
 
         # default components for transact
         self.slippage = VolumeShareSlippage()
         self.commission = PerShare()
 
-        if 'data_frequency' in kwargs:
-            self.set_data_frequency(kwargs.pop('data_frequency'))
-        else:
-            self.data_frequency = None
-
         self.instant_fill = kwargs.pop('instant_fill', False)
-
-        # Override annualizer if set
-        if 'annualizer' in kwargs:
-            self.annualizer = kwargs['annualizer']
 
         # set the capital base
         self.capital_base = kwargs.pop('capital_base', DEFAULT_CAPITAL_BASE)
 
         self.sim_params = kwargs.pop('sim_params', None)
-        if self.sim_params:
-            self.sim_params.data_frequency = self.data_frequency
-            self.perf_tracker = PerformanceTracker(self.sim_params)
+        if self.sim_params is None:
+            self.sim_params = create_simulation_parameters(
+                capital_base=self.capital_base
+            )
+        self.perf_tracker = PerformanceTracker(self.sim_params)
 
         self.blotter = kwargs.pop('blotter', None)
         if not self.blotter:
             self.blotter = Blotter()
 
         self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
         self._portfolio = None
+        self._account = None
 
-        # an algorithm subclass needs to set initialized to True when
-        # it is fully initialized.
+        self.history_container = None
+        self.history_specs = {}
+
+        # If string is passed in, execute and get reference to
+        # functions.
+        self.algoscript = kwargs.pop('script', None)
+
+        self._initialize = None
+        self._before_trading_start = None
+        self._analyze = None
+
+        self.event_manager = EventManager()
+
+        if self.algoscript is not None:
+            exec_(self.algoscript, self.namespace)
+            self._initialize = self.namespace.get('initialize')
+            if 'handle_data' not in self.namespace:
+                raise ValueError('You must define a handle_data function.')
+            else:
+                self._handle_data = self.namespace['handle_data']
+
+            self._before_trading_start = \
+                self.namespace.get('before_trading_start')
+            # Optional analyze function, gets called after run
+            self._analyze = self.namespace.get('analyze')
+
+        elif kwargs.get('initialize') and kwargs.get('handle_data'):
+            if self.algoscript is not None:
+                raise ValueError('You can not set script and \
+                initialize/handle_data.')
+            self._initialize = kwargs.pop('initialize')
+            self._handle_data = kwargs.pop('handle_data')
+            self._before_trading_start = kwargs.pop('before_trading_start',
+                                                    None)
+
+        self.event_manager.add_event(
+            zipline.utils.events.Event(
+                zipline.utils.events.Always(),
+                # We pass handle_data.__func__ to get the unbound method.
+                # We will explicitly pass the algorithm to bind it again.
+                self.handle_data.__func__,
+            ),
+            prepend=True,
+        )
+
+        # If method not defined, NOOP
+        if self._initialize is None:
+            self._initialize = lambda x: None
+
+        # Alternative way of setting data_frequency for backwards
+        # compatibility.
+        if 'data_frequency' in kwargs:
+            self.data_frequency = kwargs.pop('data_frequency')
+
+        # Subclasses that override initialize should only worry about
+        # setting self.initialized = True if AUTO_INITIALIZE is
+        # is manually set to False.
         self.initialized = False
-
-        # call to user-defined constructor method
         self.initialize(*args, **kwargs)
+        if self.AUTO_INITIALIZE:
+            self.initialized = True
+
+    def initialize(self, *args, **kwargs):
+        """
+        Call self._initialize with `self` made available to Zipline API
+        functions.
+        """
+        with ZiplineAPI(self):
+            self._initialize(self)
+
+    def before_trading_start(self):
+        if self._before_trading_start is None:
+            return
+
+        self._before_trading_start(self)
+
+    def handle_data(self, data):
+        if self.history_container:
+            self.history_container.update(data, self.datetime)
+
+        self._handle_data(self, data)
+
+    def analyze(self, perf):
+        if self._analyze is None:
+            return
+
+        with ZiplineAPI(self):
+            self._analyze(self, perf)
 
     def __repr__(self):
         """
@@ -166,7 +296,7 @@ class TradingAlgorithm(object):
                    blotter=repr(self.blotter),
                    recorded_vars=repr(self.recorded_vars))
 
-    def _create_data_generator(self, source_filter, sim_params):
+    def _create_data_generator(self, source_filter, sim_params=None):
         """
         Create a merged data generator using the sources and
         transforms attached to this algorithm.
@@ -176,13 +306,23 @@ class TradingAlgorithm(object):
         processed by the zipline, and False for those that should be
         skipped.
         """
+        if sim_params is None:
+            sim_params = self.sim_params
+
         if self.benchmark_return_source is None:
+            env = trading.environment
+            if (sim_params.data_frequency == 'minute'
+                    or sim_params.emission_rate == 'minute'):
+                update_time = lambda date: env.get_open_and_close(date)[1]
+            else:
+                update_time = lambda date: date
             benchmark_return_source = [
-                Event({'dt': dt,
+                Event({'dt': update_time(dt),
                        'returns': ret,
                        'type': zipline.protocol.DATASOURCE_TYPE.BENCHMARK,
                        'source_id': 'benchmarks'})
-                for dt, ret in trading.environment.benchmark_returns.iterkv()
+                for dt, ret in
+                trading.environment.benchmark_returns.iteritems()
                 if dt.date() >= sim_params.period_start.date()
                 and dt.date() <= sim_params.period_end.date()
             ]
@@ -192,14 +332,13 @@ class TradingAlgorithm(object):
         date_sorted = date_sorted_sources(*self.sources)
 
         if source_filter:
-            date_sorted = ifilter(source_filter, date_sorted)
+            date_sorted = filter(source_filter, date_sorted)
 
         with_tnfms = sequential_transforms(date_sorted,
                                            *self.transforms)
-        with_alias_dt = alias_dt(with_tnfms)
 
         with_benchmarks = date_sorted_sources(benchmark_return_source,
-                                              with_alias_dt)
+                                              with_tnfms)
 
         # Group together events with the same dt field. This depends on the
         # events already being sorted.
@@ -215,15 +354,16 @@ class TradingAlgorithm(object):
         processed by the zipline, and False for those that should be
         skipped.
         """
-        sim_params.data_frequency = self.data_frequency
-
-        # perf_tracker will be instantiated in __init__ if a sim_params
-        # is passed to the constructor. If not, we instantiate here.
         if self.perf_tracker is None:
+            # HACK: When running with the `run` method, we set perf_tracker to
+            # None so that it will be overwritten here.
             self.perf_tracker = PerformanceTracker(sim_params)
 
-        self.data_gen = self._create_data_generator(source_filter,
-                                                    sim_params)
+        self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
+
+        self.data_gen = self._create_data_generator(source_filter, sim_params)
 
         self.trading_client = AlgorithmSimulator(self, sim_params)
 
@@ -240,20 +380,18 @@ class TradingAlgorithm(object):
         """
         return self._create_generator(self.sim_params)
 
-    def initialize(self, *args, **kwargs):
-        pass
-
     # TODO: make a new subclass, e.g. BatchAlgorithm, and move
     # the run method to the subclass, and refactor to put the
     # generator creation logic into get_generator.
-    def run(self, source, sim_params=None, benchmark_return_source=None):
+    def run(self, source, overwrite_sim_params=True,
+            benchmark_return_source=None):
         """Run the algorithm.
 
         :Arguments:
             source : can be either:
                      - pandas.DataFrame
                      - zipline source
-                     - list of zipline sources
+                     - list of sources
 
                If pandas.DataFrame is provided, it must have the
                following structure:
@@ -267,43 +405,45 @@ class TradingAlgorithm(object):
               Daily performance metrics such as returns, alpha etc.
 
         """
-        if isinstance(source, (list, tuple)):
-            assert self.sim_params is not None or sim_params is not None, \
-                """When providing a list of sources, \
-                sim_params have to be specified as a parameter
-                or in the constructor."""
+        if isinstance(source, list):
+            if overwrite_sim_params:
+                warnings.warn("""List of sources passed, will not attempt to extract sids, and start and end
+ dates. Make sure to set the correct fields in sim_params passed to
+ __init__().""", UserWarning)
+                overwrite_sim_params = False
         elif isinstance(source, pd.DataFrame):
             # if DataFrame provided, wrap in DataFrameSource
             source = DataFrameSource(source)
         elif isinstance(source, pd.Panel):
             source = DataPanelSource(source)
 
-        if not isinstance(source, (list, tuple)):
-            self.sources = [source]
+        if isinstance(source, list):
+            self.set_sources(source)
         else:
-            self.sources = source
+            self.set_sources([source])
 
-        # Check for override of sim_params.
-        # If it isn't passed to this function,
-        # use the default params set with the algorithm.
-        # Else, we create simulation parameters using the start and end of the
-        # source provided.
-        if not sim_params:
-            if not self.sim_params:
-                start = source.start
-                end = source.end
+        # Override sim_params if params are provided by the source.
+        if overwrite_sim_params:
+            if hasattr(source, 'start'):
+                self.sim_params.period_start = source.start
+            if hasattr(source, 'end'):
+                self.sim_params.period_end = source.end
+            all_sids = [sid for s in self.sources for sid in s.sids]
+            self.sim_params.sids = set(all_sids)
+            # Changing period_start and period_close might require updating
+            # of first_open and last_close.
+            self.sim_params._update_internal()
 
-                sim_params = create_simulation_parameters(
-                    start=start,
-                    end=end,
-                    capital_base=self.capital_base
-                )
-            else:
-                sim_params = self.sim_params
+        # Create history containers
+        if len(self.history_specs) != 0:
+            self.history_container = HistoryContainer(
+                self.history_specs,
+                self.sim_params.sids,
+                self.sim_params.first_open)
 
         # Create transforms by wrapping them into StatefulTransforms
         self.transforms = []
-        for namestring, trans_descr in self.registered_transforms.iteritems():
+        for namestring, trans_descr in iteritems(self.registered_transforms):
             sf = StatefulTransform(
                 trans_descr['class'],
                 *trans_descr['args'],
@@ -318,16 +458,19 @@ class TradingAlgorithm(object):
         self.perf_tracker = None
 
         # create transforms and zipline
-        self.gen = self._create_generator(sim_params)
+        self.gen = self._create_generator(self.sim_params)
 
-        # loop through simulated_trading, each iteration returns a
-        # perf dictionary
-        perfs = []
-        for perf in self.gen:
-            perfs.append(perf)
+        with ZiplineAPI(self):
+            # loop through simulated_trading, each iteration returns a
+            # perf dictionary
+            perfs = []
+            for perf in self.gen:
+                perfs.append(perf)
 
-        # convert perf dict to pandas dataframe
-        daily_stats = self._create_daily_stats(perfs)
+            # convert perf dict to pandas dataframe
+            daily_stats = self._create_daily_stats(perfs)
+
+        self.analyze(daily_stats)
 
         return daily_stats
 
@@ -371,17 +514,161 @@ class TradingAlgorithm(object):
                                            'args': args,
                                            'kwargs': kwargs}
 
-    def record(self, **kwargs):
+    @api_method
+    def get_environment(self):
+        return self._environment
+
+    def add_event(self, rule=None, callback=None):
+        """
+        Adds an event to the algorithm's EventManager.
+        """
+        self.event_manager.add_event(
+            zipline.utils.events.Event(rule, callback),
+        )
+
+    @api_method
+    def schedule_function(self,
+                          func,
+                          date_rule=None,
+                          time_rule=None,
+                          half_days=True):
+        """
+        Schedules a function to be called with some timed rules.
+        """
+        if self.sim_params.data_frequency != 'minute':
+            raise IncompatibleScheduleFunctionDataFrequency()
+
+        date_rule = date_rule or DateRuleFactory.every_day()
+        time_rule = time_rule or TimeRuleFactory.market_open()
+
+        self.add_event(
+            make_eventrule(date_rule, time_rule, half_days),
+            func,
+        )
+
+    @api_method
+    def record(self, *args, **kwargs):
         """
         Track and record local variable (i.e. attributes) each day.
         """
-        for name, value in kwargs.items():
+        # Make 2 objects both referencing the same iterator
+        args = [iter(args)] * 2
+
+        # Zip generates list entries by calling `next` on each iterator it
+        # receives.  In this case the two iterators are the same object, so the
+        # call to next on args[0] will also advance args[1], resulting in zip
+        # returning (a,b) (c,d) (e,f) rather than (a,a) (b,b) (c,c) etc.
+        positionals = zip(*args)
+        for name, value in chain(positionals, iteritems(kwargs)):
             self._recorded_vars[name] = value
 
-    def order(self, sid, amount, limit_price=None, stop_price=None):
-        return self.blotter.order(sid, amount, limit_price, stop_price)
+    @api_method
+    def symbol(self, symbol_str, as_of_date=None):
+        """
+        Default symbol lookup for any source that directly maps the
+        symbol to the identifier (e.g. yahoo finance).
+        Keyword argument as_of_date is ignored.
+        """
+        return symbol_str
 
-    def order_value(self, sid, value, limit_price=None, stop_price=None):
+    @api_method
+    def order(self, sid, amount,
+              limit_price=None,
+              stop_price=None,
+              style=None):
+        """
+        Place an order using the specified parameters.
+        """
+
+        def round_if_near_integer(a, epsilon=1e-4):
+            """
+            Round a to the nearest integer if that integer is within an epsilon
+            of a.
+            """
+            if abs(a - round(a)) <= epsilon:
+                return round(a)
+            else:
+                return a
+
+        # Truncate to the integer share count that's either within .0001 of
+        # amount or closer to zero.
+        # E.g. 3.9999 -> 4.0; 5.5 -> 5.0; -5.5 -> -5.0
+        amount = int(round_if_near_integer(amount))
+
+        # Raises a ZiplineError if invalid parameters are detected.
+        self.validate_order_params(sid,
+                                   amount,
+                                   limit_price,
+                                   stop_price,
+                                   style)
+
+        # Convert deprecated limit_price and stop_price parameters to use
+        # ExecutionStyle objects.
+        style = self.__convert_order_params_for_blotter(limit_price,
+                                                        stop_price,
+                                                        style)
+        return self.blotter.order(sid, amount, style)
+
+    def validate_order_params(self,
+                              sid,
+                              amount,
+                              limit_price,
+                              stop_price,
+                              style):
+        """
+        Helper method for validating parameters to the order API function.
+
+        Raises an UnsupportedOrderParameters if invalid arguments are found.
+        """
+
+        if not self.initialized:
+            raise OrderDuringInitialize(
+                msg="order() can only be called from within handle_data()"
+            )
+
+        if style:
+            if limit_price:
+                raise UnsupportedOrderParameters(
+                    msg="Passing both limit_price and style is not supported."
+                )
+
+            if stop_price:
+                raise UnsupportedOrderParameters(
+                    msg="Passing both stop_price and style is not supported."
+                )
+
+        for control in self.trading_controls:
+            control.validate(sid,
+                             amount,
+                             self.updated_portfolio(),
+                             self.get_datetime(),
+                             self.trading_client.current_data)
+
+    @staticmethod
+    def __convert_order_params_for_blotter(limit_price, stop_price, style):
+        """
+        Helper method for converting deprecated limit_price and stop_price
+        arguments into ExecutionStyle instances.
+
+        This function assumes that either style == None or (limit_price,
+        stop_price) == (None, None).
+        """
+        # TODO_SS: DeprecationWarning for usage of limit_price and stop_price.
+        if style:
+            assert (limit_price, stop_price) == (None, None)
+            return style
+        if limit_price and stop_price:
+            return StopLimitOrder(limit_price, stop_price)
+        if limit_price:
+            return LimitOrder(limit_price)
+        if stop_price:
+            return StopOrder(stop_price)
+        else:
+            return MarketOrder()
+
+    @api_method
+    def order_value(self, sid, value,
+                    limit_price=None, stop_price=None, style=None):
         """
         Place an order by desired value rather than desired number of shares.
         If the requested sid is found in the universe, the requested value is
@@ -399,12 +686,16 @@ class TradingAlgorithm(object):
             zero_message = "Price of 0 for {psid}; can't infer value".format(
                 psid=sid
             )
-            self.logger.debug(zero_message)
+            if self.logger:
+                self.logger.debug(zero_message)
             # Don't place any order
             return
         else:
             amount = value / last_price
-            return self.order(sid, amount, limit_price, stop_price)
+            return self.order(sid, amount,
+                              limit_price=limit_price,
+                              stop_price=stop_price,
+                              style=style)
 
     @property
     def recorded_vars(self):
@@ -412,35 +703,58 @@ class TradingAlgorithm(object):
 
     @property
     def portfolio(self):
-        # internally this will cause a refresh of the
-        # period performance calculations.
-        return self.perf_tracker.get_portfolio()
+        return self.updated_portfolio()
 
     def updated_portfolio(self):
-        # internally this will cause a refresh of the
-        # period performance calculations.
         if self.portfolio_needs_update:
-            self._portfolio = self.perf_tracker.get_portfolio()
+            self._portfolio = \
+                self.perf_tracker.get_portfolio(self.performance_needs_update)
             self.portfolio_needs_update = False
+            self.performance_needs_update = False
         return self._portfolio
+
+    @property
+    def account(self):
+        return self.updated_account()
+
+    def updated_account(self):
+        if self.account_needs_update:
+            self._account = \
+                self.perf_tracker.get_account(self.performance_needs_update)
+            self.account_needs_update = False
+            self.performance_needs_update = False
+        return self._account
 
     def set_logger(self, logger):
         self.logger = logger
 
-    def set_datetime(self, dt):
+    def on_dt_changed(self, dt):
+        """
+        Callback triggered by the simulation loop whenever the current dt
+        changes.
+
+        Any logic that should happen exactly once at the start of each datetime
+        group should happen here.
+        """
         assert isinstance(dt, datetime), \
             "Attempt to set algorithm's current time with non-datetime"
         assert dt.tzinfo == pytz.utc, \
             "Algorithm expects a utc datetime"
-        self.datetime = dt
 
-    def get_datetime(self):
+        self.datetime = dt
+        self.perf_tracker.set_date(dt)
+        self.blotter.set_date(dt)
+
+    @api_method
+    def get_datetime(self, tz=None):
         """
         Returns a copy of the datetime.
         """
         date_copy = copy(self.datetime)
         assert date_copy.tzinfo == pytz.utc, \
             "Algorithm should have a utc datetime"
+        if tz is not None:
+            date_copy = date_copy.tz_convert(tz)
         return date_copy
 
     def set_transact(self, transact):
@@ -450,6 +764,14 @@ class TradingAlgorithm(object):
         """
         self.blotter.transact = transact
 
+    def update_dividends(self, dividend_frame):
+        """
+        Set DataFrame used to process dividends.  DataFrame columns should
+        contain at least the entries in zp.DIVIDEND_FIELDS.
+        """
+        self.perf_tracker.update_dividends(dividend_frame)
+
+    @api_method
     def set_slippage(self, slippage):
         if not isinstance(slippage, SlippageModel):
             raise UnsupportedSlippageModel()
@@ -457,6 +779,7 @@ class TradingAlgorithm(object):
             raise OverrideSlippagePostInit()
         self.slippage = slippage
 
+    @api_method
     def set_commission(self, commission):
         if not isinstance(commission, (PerShare, PerTrade, PerDollar)):
             raise UnsupportedCommissionModel()
@@ -473,12 +796,19 @@ class TradingAlgorithm(object):
         assert isinstance(transforms, list)
         self.transforms = transforms
 
-    def set_data_frequency(self, data_frequency):
-        assert data_frequency in ('daily', 'minute')
-        self.data_frequency = data_frequency
-        self.annualizer = ANNUALIZER[self.data_frequency]
+    # Remain backwards compatibility
+    @property
+    def data_frequency(self):
+        return self.sim_params.data_frequency
 
-    def order_percent(self, sid, percent, limit_price=None, stop_price=None):
+    @data_frequency.setter
+    def data_frequency(self, value):
+        assert value in ('daily', 'minute')
+        self.sim_params.data_frequency = value
+
+    @api_method
+    def order_percent(self, sid, percent,
+                      limit_price=None, stop_price=None, style=None):
         """
         Place an order in the specified security corresponding to the given
         percent of the current portfolio value.
@@ -486,9 +816,14 @@ class TradingAlgorithm(object):
         Note that percent must expressed as a decimal (0.50 means 50\%).
         """
         value = self.portfolio.portfolio_value * percent
-        return self.order_value(sid, value, limit_price, stop_price)
+        return self.order_value(sid, value,
+                                limit_price=limit_price,
+                                stop_price=stop_price,
+                                style=style)
 
-    def order_target(self, sid, target, limit_price=None, stop_price=None):
+    @api_method
+    def order_target(self, sid, target,
+                     limit_price=None, stop_price=None, style=None):
         """
         Place an order to adjust a position to a target number of shares. If
         the position doesn't already exist, this is equivalent to placing a new
@@ -499,12 +834,19 @@ class TradingAlgorithm(object):
         if sid in self.portfolio.positions:
             current_position = self.portfolio.positions[sid].amount
             req_shares = target - current_position
-            return self.order(sid, req_shares, limit_price, stop_price)
+            return self.order(sid, req_shares,
+                              limit_price=limit_price,
+                              stop_price=stop_price,
+                              style=style)
         else:
-            return self.order(sid, target, limit_price, stop_price)
+            return self.order(sid, target,
+                              limit_price=limit_price,
+                              stop_price=stop_price,
+                              style=style)
 
-    def order_target_value(self, sid, target, limit_price=None,
-                           stop_price=None):
+    @api_method
+    def order_target_value(self, sid, target,
+                           limit_price=None, stop_price=None, style=None):
         """
         Place an order to adjust a position to a target value. If
         the position doesn't already exist, this is equivalent to placing a new
@@ -512,17 +854,22 @@ class TradingAlgorithm(object):
         order for the difference between the target value and the
         current value.
         """
-        if sid in self.portfolio.positions:
-            current_position = self.portfolio.positions[sid].amount
-            current_price = self.portfolio.positions[sid].last_sale_price
-            current_value = current_position * current_price
-            req_value = target - current_value
-            return self.order_value(sid, req_value, limit_price, stop_price)
-        else:
-            return self.order_value(sid, target, limit_price, stop_price)
+        last_price = self.trading_client.current_data[sid].price
+        if np.allclose(last_price, 0):
+            # Don't place an order
+            if self.logger:
+                zero_message = "Price of 0 for {psid}; can't infer value"
+                self.logger.debug(zero_message.format(psid=sid))
+            return
+        target_amount = target / last_price
+        return self.order_target(sid, target_amount,
+                                 limit_price=limit_price,
+                                 stop_price=stop_price,
+                                 style=style)
 
-    def order_target_percent(self, sid, target, limit_price=None,
-                             stop_price=None):
+    @api_method
+    def order_target_percent(self, sid, target,
+                             limit_price=None, stop_price=None, style=None):
         """
         Place an order to adjust a position to a target percent of the
         current portfolio value. If the position doesn't already exist, this is
@@ -532,13 +879,125 @@ class TradingAlgorithm(object):
 
         Note that target must expressed as a decimal (0.50 means 50\%).
         """
-        if sid in self.portfolio.positions:
-            current_position = self.portfolio.positions[sid].amount
-            current_price = self.portfolio.positions[sid].last_sale_price
-            current_value = current_position * current_price
-        else:
-            current_value = 0
         target_value = self.portfolio.portfolio_value * target
+        return self.order_target_value(sid, target_value,
+                                       limit_price=limit_price,
+                                       stop_price=stop_price,
+                                       style=style)
 
-        req_value = target_value - current_value
-        return self.order_value(sid, req_value, limit_price, stop_price)
+    @api_method
+    def get_open_orders(self, sid=None):
+        if sid is None:
+            return {
+                key: [order.to_api_obj() for order in orders]
+                for key, orders in iteritems(self.blotter.open_orders)
+                if orders
+            }
+        if sid in self.blotter.open_orders:
+            orders = self.blotter.open_orders[sid]
+            return [order.to_api_obj() for order in orders]
+        return []
+
+    @api_method
+    def get_order(self, order_id):
+        if order_id in self.blotter.orders:
+            return self.blotter.orders[order_id].to_api_obj()
+
+    @api_method
+    def cancel_order(self, order_param):
+        order_id = order_param
+        if isinstance(order_param, zipline.protocol.Order):
+            order_id = order_param.id
+
+        self.blotter.cancel(order_id)
+
+    @api_method
+    def add_history(self, bar_count, frequency, field,
+                    ffill=True):
+        data_frequency = self.sim_params.data_frequency
+        daily_at_midnight = (data_frequency == 'daily')
+
+        history_spec = HistorySpec(bar_count, frequency, field, ffill,
+                                   daily_at_midnight=daily_at_midnight,
+                                   data_frequency=data_frequency)
+        self.history_specs[history_spec.key_str] = history_spec
+
+    @api_method
+    def history(self, bar_count, frequency, field, ffill=True):
+        spec_key_str = HistorySpec.spec_key(
+            bar_count, frequency, field, ffill)
+        history_spec = self.history_specs[spec_key_str]
+        return self.history_container.get_history(history_spec, self.datetime)
+
+    ####################
+    # Trading Controls #
+    ####################
+
+    def register_trading_control(self, control):
+        """
+        Register a new TradingControl to be checked prior to order calls.
+        """
+        if self.initialized:
+            raise RegisterTradingControlPostInit()
+        self.trading_controls.append(control)
+
+    @api_method
+    def set_max_position_size(self,
+                              sid=None,
+                              max_shares=None,
+                              max_notional=None):
+        """
+        Set a limit on the number of shares and/or dollar value held for the
+        given sid. Limits are treated as absolute values and are enforced at
+        the time that the algo attempts to place an order for sid. This means
+        that it's possible to end up with more than the max number of shares
+        due to splits/dividends, and more than the max notional due to price
+        improvement.
+
+        If an algorithm attempts to place an order that would result in
+        increasing the absolute value of shares/dollar value exceeding one of
+        these limits, raise a TradingControlException.
+        """
+        control = MaxPositionSize(sid=sid,
+                                  max_shares=max_shares,
+                                  max_notional=max_notional)
+        self.register_trading_control(control)
+
+    @api_method
+    def set_max_order_size(self, sid=None, max_shares=None, max_notional=None):
+        """
+        Set a limit on the number of shares and/or dollar value of any single
+        order placed for sid.  Limits are treated as absolute values and are
+        enforced at the time that the algo attempts to place an order for sid.
+
+        If an algorithm attempts to place an order that would result in
+        exceeding one of these limits, raise a TradingControlException.
+        """
+        control = MaxOrderSize(sid=sid,
+                               max_shares=max_shares,
+                               max_notional=max_notional)
+        self.register_trading_control(control)
+
+    @api_method
+    def set_max_order_count(self, max_count):
+        """
+        Set a limit on the number of orders that can be placed within the given
+        time interval.
+        """
+        control = MaxOrderCount(max_count)
+        self.register_trading_control(control)
+
+    @api_method
+    def set_long_only(self):
+        """
+        Set a rule specifying that this algorithm cannot take short positions.
+        """
+        self.register_trading_control(LongOnly())
+
+    @classmethod
+    def all_api_methods(cls):
+        """
+        Return a list of all the TradingAlgorithm API methods.
+        """
+        return [fn for fn in cls.__dict__.itervalues()
+                if getattr(fn, 'is_api_method', False)]

@@ -17,7 +17,6 @@
 """
 Generator versions of transforms.
 """
-import types
 import logbook
 
 
@@ -25,10 +24,13 @@ from numbers import Integral
 
 from datetime import datetime
 from collections import deque
-from abc import ABCMeta, abstractmethod
+from abc import ABCMeta, abstractmethod, abstractproperty
 
-from zipline.protocol import DATASOURCE_TYPE
+from six import with_metaclass
+
+from zipline.errors import WrongDataForTransform
 from zipline.gens.utils import assert_sort_unframe_protocol, hash_args
+from zipline.protocol import DATASOURCE_TYPE
 from zipline.finance import trading
 
 log = logbook.Logger('Transform')
@@ -92,8 +94,6 @@ class StatefulTransform(object):
     Otherwise only dt, tnfm_id, and tnfm_value are forwarded.
     """
     def __init__(self, tnfm_class, *args, **kwargs):
-        assert isinstance(tnfm_class, (types.ObjectType, types.ClassType)), \
-            "Stateful transform requires a class."
         assert hasattr(tnfm_class, 'update'), \
             "Stateful transform requires the class to have an update method"
 
@@ -129,7 +129,7 @@ class StatefulTransform(object):
         # other streams.  Transforms that modify their input
         # messages should only manipulate copies.
         for message in stream_in:
-            # we only handle TRADE events.
+            # we only handle TRADE and CUSTOM events.
             if (hasattr(message, 'type')
                     and message.type not in (
                         DATASOURCE_TYPE.TRADE,
@@ -143,14 +143,29 @@ class StatefulTransform(object):
 
             assert_sort_unframe_protocol(message)
 
-            tnfm_value = self.state.update(message)
+            try:
+                tnfm_value = self.state.update(message)
+            except WrongDataForTransform:
+                # Transform classes should raise WrongDataForTransform if they
+                # are unable to process the event BEFORE performing any state
+                # modifications, because we continue the simulation if a
+                # WrongDataForTransform is raised on a CUSTOM event.
+                if message.type == DATASOURCE_TYPE.CUSTOM:
+                    # Pass through custom events that are not applicable to
+                    # this transform.
+                    yield message
+                    continue
+                else:
+                    # If a TRADE event raises a WrongDataForTransform,
+                    # something bad has happend.
+                    raise
 
             out_message = message
             out_message[self.namestring] = tnfm_value
             yield out_message
 
 
-class EventWindow(object):
+class EventWindow(with_metaclass(ABCMeta)):
     """
     Abstract base class for transform classes that calculate iterative
     metrics on events within a given timedelta.  Maintains a list of
@@ -169,7 +184,6 @@ class EventWindow(object):
     price.
     """
     # Mark this as an abstract base class.
-    __metaclass__ = ABCMeta
 
     def __init__(self, market_aware=True, window_length=None, delta=None):
 
@@ -195,6 +209,10 @@ class EventWindow(object):
     def handle_add(self, event):
         raise NotImplementedError()
 
+    @abstractproperty
+    def fields(self):
+        raise NotImplementedError()
+
     @abstractmethod
     def handle_remove(self, event):
         raise NotImplementedError()
@@ -204,13 +222,8 @@ class EventWindow(object):
 
     def update(self, event):
 
-        if (hasattr(event, 'type')
-                and event.type not in (
-                    DATASOURCE_TYPE.TRADE,
-                    DATASOURCE_TYPE.CUSTOM)):
-            return
-
         self.assert_well_formed(event)
+
         # Add new event and increment totals.
         self.ticks.append(event)
 
@@ -247,9 +260,13 @@ class EventWindow(object):
 
         return trading_days_between >= self.window_length
 
-    # All event windows expect to receive events with datetime fields
-    # that arrive in sorted order.
     def assert_well_formed(self, event):
+        """
+        Verify that the supplied event contains all the fields required by this
+        EventWindow to be processed.
+        """
+        self.check_required_fields(event)
+
         assert isinstance(event.dt, datetime), \
             "Bad dt in EventWindow:%s" % event
         if len(self.ticks) > 0:
@@ -257,3 +274,23 @@ class EventWindow(object):
             assert event.dt >= self.ticks[-1].dt, \
                 "Events arrived out of order in EventWindow: %s -> %s" % \
                 (event, self.ticks[0])
+
+    def check_required_fields(self, event):
+        """
+        We only allow events with all of our tracked fields.
+        """
+        # All events require a 'dt' field.
+        if not hasattr(event, 'dt'):
+            raise WrongDataForTransform(
+                transform=self.__class__.__name__,
+                fields=['dt'],
+            )
+
+        # Subclasses must implement the 'fields' property to specify other
+        # required fields.
+        for field in self.fields:
+            if field not in event:
+                raise WrongDataForTransform(
+                    transform=self.__class__.__name__,
+                    fields=self.fields,
+                )

@@ -57,13 +57,8 @@ class ExceptionTestCase(TestCase):
             **self.zipline_test_config
         )
 
-        with self.assertRaises(ZeroDivisionError) as ctx:
+        with self.assertRaises(ZeroDivisionError):
             output, _ = drain_zipline(self, zipline)
-
-        self.assertEqual(
-            ctx.exception.message,
-            'integer division or modulo by zero'
-        )
 
     def test_tranform_exception(self):
         exc_tnfm = StatefulTransform(ExceptionTransform)
@@ -76,7 +71,7 @@ class ExceptionTestCase(TestCase):
         with self.assertRaises(AssertionError) as ctx:
             output, _ = drain_zipline(self, zipline)
 
-        self.assertEqual(ctx.exception.message,
+        self.assertEqual(str(ctx.exception),
                          'An assertion message')
 
     def test_exception_in_handle_data(self):
@@ -87,7 +82,7 @@ class ExceptionTestCase(TestCase):
                 'handle_data',
                 self.zipline_test_config['sid'],
                 sim_params=factory.create_simulation_parameters()
-            )
+        )
 
         zipline = simfactory.create_test_zipline(
             **self.zipline_test_config
@@ -96,7 +91,7 @@ class ExceptionTestCase(TestCase):
         with self.assertRaises(Exception) as ctx:
             output, _ = drain_zipline(self, zipline)
 
-        self.assertEqual(ctx.exception.message,
+        self.assertEqual(str(ctx.exception),
                          'Algo exception in handle_data')
 
     def test_zerodivision_exception_in_handle_data(self):
@@ -107,17 +102,14 @@ class ExceptionTestCase(TestCase):
             DivByZeroAlgorithm(
                 self.zipline_test_config['sid'],
                 sim_params=factory.create_simulation_parameters()
-            )
+        )
 
         zipline = simfactory.create_test_zipline(
             **self.zipline_test_config
         )
 
-        with self.assertRaises(ZeroDivisionError) as ctx:
+        with self.assertRaises(ZeroDivisionError):
             output, _ = drain_zipline(self, zipline)
-
-        self.assertEqual(ctx.exception.message,
-                         'integer division or modulo by zero')
 
     def test_set_portfolio(self):
         """
@@ -130,14 +122,11 @@ class ExceptionTestCase(TestCase):
             SetPortfolioAlgorithm(
                 self.zipline_test_config['sid'],
                 sim_params=factory.create_simulation_parameters()
-            )
+        )
 
         zipline = simfactory.create_test_zipline(
             **self.zipline_test_config
         )
 
-        with self.assertRaises(AttributeError) as ctx:
+        with self.assertRaises(AttributeError):
             output, _ = drain_zipline(self, zipline)
-
-        self.assertEqual(ctx.exception.message,
-                         "can't set attribute")

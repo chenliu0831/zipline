@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -42,11 +42,12 @@ else:
 
 setup(
     name='zipline',
-    version='0.5.11.dev',
+    version='0.7.0',
     description='A backtester for financial algorithms.',
     author='Quantopian Inc.',
     author_email='opensource@quantopian.com',
     packages=find_packages(),
+    scripts=['scripts/run_algo.py'],
     long_description=LONG_DESCRIPTION,
     license='Apache 2.0',
     classifiers=[
@@ -55,6 +56,7 @@ setup(
         'Natural Language :: English',
         'Programming Language :: Python',
         'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3.3',
         'Operating System :: OS Independent',
         'Intended Audience :: Science/Research',
         'Topic :: Office/Business :: Financial',
@@ -62,13 +64,15 @@ setup(
         'Topic :: System :: Distributed Computing',
     ],
     install_requires=[
-        'iso8601',
         'Logbook',
-        'blist',
         'pytz',
         'requests',
         'numpy',
-        'pandas'
+        'pandas',
+        'six'
     ],
+    extras_require = {
+        'talib':  ["talib"],
+    },
     url="https://github.com/quantopian/zipline"
 )

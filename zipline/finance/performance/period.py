@@ -1,5 +1,5 @@
 #
-# Copyright 2013 Quantopian, Inc.
+# Copyright 2014 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -75,7 +75,11 @@ import logbook
 
 import numpy as np
 import pandas as pd
-from collections import OrderedDict, defaultdict
+from collections import (
+    defaultdict,
+    OrderedDict,
+)
+from six import iteritems, itervalues
 
 import zipline.protocol as zp
 from . position import positiondict
@@ -100,6 +104,7 @@ class PerformancePeriod(object):
         self.ending_value = 0.0
         self.period_cash_flow = 0.0
         self.pnl = 0.0
+
         # sid => position object
         self.positions = positiondict()
         self.ending_cash = starting_cash
@@ -118,8 +123,13 @@ class PerformancePeriod(object):
         # when returning portfolio information.
         # So as not to avoid creating a new object for each event
         self._portfolio_store = zp.Portfolio()
+        self._account_store = zp.Account()
         self._positions_store = zp.Positions()
         self.serialize_positions = serialize_positions
+
+        self._unpaid_dividends = pd.DataFrame(
+            columns=zp.DIVIDEND_PAYMENT_FIELDS,
+        )
 
     def rollover(self):
         self.starting_value = self.ending_value
@@ -140,44 +150,94 @@ class PerformancePeriod(object):
             self._position_last_sale_prices = \
                 self._position_last_sale_prices.append(pd.Series({sid: 0.0}))
 
-    def add_dividend(self, div):
-        # The dividend is received on midnight of the dividend
-        # declared date. We calculate the dividends based on the amount of
-        # stock owned on midnight of the ex dividend date. However, the cash
-        # is not dispersed until the payment date, which is
-        # included in the event.
-        self.positions[div.sid].add_dividend(div)
-
     def handle_split(self, split):
         if split.sid in self.positions:
             # Make the position object handle the split. It returns the
             # leftover cash from a fractional share, if there is any.
-            leftover_cash = self.positions[split.sid].handle_split(split)
+            position = self.positions[split.sid]
+            leftover_cash = position.handle_split(split)
+            self._position_amounts[split.sid] = position.amount
+            self._position_last_sale_prices[split.sid] = \
+                position.last_sale_price
 
             if leftover_cash > 0:
                 self.handle_cash_payment(leftover_cash)
 
-    def update_dividends(self, todays_date):
+    def earn_dividends(self, dividend_frame):
         """
-        Check the payment date and ex date against today's date
-        to determine if we are owed a dividend payment or if the
-        payment has been disbursed.
+        Given a frame of dividends whose ex_dates are all the next trading day,
+        calculate and store the cash and/or stock payments to be paid on each
+        dividend's pay date.
         """
-        cash_payments = 0.0
-        for sid, pos in self.positions.iteritems():
-            cash_payments += pos.update_dividends(todays_date)
+        earned = dividend_frame.apply(self._maybe_earn_dividend, axis=1)\
+                               .dropna(how='all')
+        if len(earned) > 0:
+            # Store the earned dividends so that they can be paid on the
+            # dividends' pay_dates.
+            self._unpaid_dividends = pd.concat(
+                [self._unpaid_dividends, earned],
+            )
 
-        # credit our cash balance with the dividend payments, or
-        # if we are short, debit our cash balance with the
-        # payments.
-        # debit our cumulative cash spent with the dividend
-        # payments, or credit our cumulative cash spent if we are
-        # short the stock.
-        self.handle_cash_payment(cash_payments)
+    def _maybe_earn_dividend(self, dividend):
+        """
+        Take a historical dividend record and return a Series with fields in
+        zipline.protocol.DIVIDEND_FIELDS (plus an 'id' field) representing
+        the cash/stock amount we are owed when the dividend is paid.
+        """
+        if dividend['sid'] in self.positions:
+            return self.positions[dividend['sid']].earn_dividend(dividend)
+        else:
+            return zp.dividend_payment()
 
-        # recalculate performance, including the dividend
-        # payments
+    def pay_dividends(self, dividend_frame):
+        """
+        Given a frame of dividends whose pay_dates are all the next trading
+        day, grant the cash and/or stock payments that were calculated on the
+        given dividends' ex dates.
+        """
+        payments = dividend_frame.apply(self._maybe_pay_dividend, axis=1)\
+                                 .dropna(how='all')
+
+        # Mark these dividends as paid by dropping them from our unpaid
+        # table.
+        self._unpaid_dividends.drop(payments.index)
+
+        # Add cash equal to the net cash payed from all dividends.  Note that
+        # "negative cash" is effectively paid if we're short a security,
+        # representing the fact that we're required to reimburse the owner of
+        # the stock for any dividends paid while borrowing.
+        net_cash_payment = payments['cash_amount'].fillna(0).sum()
+        if net_cash_payment:
+            self.handle_cash_payment(net_cash_payment)
+
+        # Add stock for any stock dividends paid.  Again, the values here may
+        # be negative in the case of short positions.
+        stock_payments = payments[payments['payment_sid'].notnull()]
+        for _, row in stock_payments.iterrows():
+            stock = row['payment_sid']
+            share_count = row['share_count']
+            position = self.positions[stock]
+
+            position.amount += share_count
+            self.ensure_position_index(stock)
+            self._position_amounts[stock] = position.amount
+            self._position_last_sale_prices[stock] = \
+                position.last_sale_price
+
+        # Recalculate performance after applying dividend benefits.
         self.calculate_performance()
+
+    def _maybe_pay_dividend(self, dividend):
+        """
+        Take a historical dividend record, look up any stored record of
+        cash/stock we are owed for that dividend, and return a Series
+        with fields drawn from zipline.protocol.DIVIDEND_PAYMENT_FIELDS.
+        """
+        try:
+            unpaid_dividend = self._unpaid_dividends.loc[dividend['id']]
+            return unpaid_dividend
+        except KeyError:
+            return zp.dividend_payment()
 
     def handle_cash_payment(self, payment_amount):
         self.adjust_cash(payment_amount)
@@ -192,6 +252,9 @@ class PerformancePeriod(object):
 
     def adjust_cash(self, amount):
         self.period_cash_flow += amount
+
+    def adjust_field(self, field, value):
+        setattr(self, field, value)
 
     def calculate_performance(self):
         self.ending_value = self.calculate_positions_value()
@@ -238,18 +301,19 @@ class PerformancePeriod(object):
     def execute_transaction(self, txn):
         # Update Position
         # ----------------
+
+        # NOTE: self.positions has defaultdict semantics, so this will create
+        # an empty position if one does not already exist.
         position = self.positions[txn.sid]
         position.update(txn)
         self.ensure_position_index(txn.sid)
         self._position_amounts[txn.sid] = position.amount
+        self._position_last_sale_prices[txn.sid] = position.last_sale_price
 
         self.period_cash_flow -= txn.price * txn.amount
 
         if self.keep_transactions:
             self.processed_transactions[txn.dt].append(txn)
-
-    def round_to_nearest(self, x, base=5):
-        return int(base * round(float(x) / base))
 
     def calculate_positions_value(self):
         return np.dot(self._position_amounts, self._position_last_sale_prices)
@@ -262,7 +326,7 @@ class PerformancePeriod(object):
             return
 
         if not pd.isnull(event.price):
-        # isnan check will keep the last price if its not present
+            # isnan check will keep the last price if its not present
             self.update_position(event.sid, last_sale_price=event.price,
                                  last_sale_date=event.dt)
 
@@ -307,7 +371,7 @@ class PerformancePeriod(object):
             else:
                 transactions = \
                     [y.to_dict()
-                     for x in self.processed_transactions.itervalues()
+                     for x in itervalues(self.processed_transactions)
                      for y in x]
             rval['transactions'] = transactions
 
@@ -315,9 +379,9 @@ class PerformancePeriod(object):
             if dt:
                 # only include orders modified as of the given dt.
                 orders = [x.to_dict()
-                          for x in self.orders_by_modified[dt].itervalues()]
+                          for x in itervalues(self.orders_by_modified[dt])]
             else:
-                orders = [x.to_dict() for x in self.orders_by_id.itervalues()]
+                orders = [x.to_dict() for x in itervalues(self.orders_by_id)]
             rval['orders'] = orders
 
         return rval
@@ -348,23 +412,78 @@ class PerformancePeriod(object):
         portfolio.positions_value = self.ending_value
         return portfolio
 
+    def as_account(self):
+        account = self._account_store
+
+        # If no attribute is found on the PerformancePeriod resort to the
+        # following default values. If an attribute is found use the existing
+        # value. For instance, a broker may provide updates to these
+        # attributes. In this case we do not want to over write the broker
+        # values with the default values.
+        account.settled_cash = \
+            getattr(self, 'settled_cash', self.ending_cash)
+        account.accrued_interest = \
+            getattr(self, 'accrued_interest', 0.0)
+        account.buying_power = \
+            getattr(self, 'buying_power', float('inf'))
+        account.equity_with_loan = \
+            getattr(self, 'equity_with_loan',
+                    self.ending_cash + self.ending_value)
+        account.total_positions_value = \
+            getattr(self, 'total_positions_value', self.ending_value)
+        account.regt_equity = \
+            getattr(self, 'regt_equity', self.ending_cash)
+        account.regt_margin = \
+            getattr(self, 'regt_margin', float('inf'))
+        account.initial_margin_requirement = \
+            getattr(self, 'initial_margin_requirement', 0.0)
+        account.maintenance_margin_requirement = \
+            getattr(self, 'maintenance_margin_requirement', 0.0)
+        account.available_funds = \
+            getattr(self, 'available_funds', self.ending_cash)
+        account.excess_liquidity = \
+            getattr(self, 'excess_liquidity', self.ending_cash)
+        account.cushion = \
+            getattr(self, 'cushion',
+                    self.ending_cash / (self.ending_cash + self.ending_value))
+        account.day_trades_remaining = \
+            getattr(self, 'day_trades_remaining', float('inf'))
+        account.leverage = \
+            getattr(self, 'leverage',
+                    self.ending_value / (self.ending_value + self.ending_cash))
+        account.net_liquidation = \
+            getattr(self, 'net_liquidation',
+                    self.ending_cash + self.ending_value)
+        return account
+
     def get_positions(self):
 
         positions = self._positions_store
 
-        for sid, pos in self.positions.iteritems():
-            if sid not in positions:
-                positions[sid] = zp.Position(sid)
+        for sid, pos in iteritems(self.positions):
+
+            if pos.amount == 0:
+                # Clear out the position if it has become empty since the last
+                # time get_positions was called.  Catching the KeyError is
+                # faster than checking `if sid in positions`, and this can be
+                # potentially called in a tight inner loop.
+                try:
+                    del positions[sid]
+                except KeyError:
+                    pass
+                continue
+
+            # Note that this will create a position if we don't currently have
+            # an entry
             position = positions[sid]
             position.amount = pos.amount
             position.cost_basis = pos.cost_basis
             position.last_sale_price = pos.last_sale_price
-
         return positions
 
     def get_positions_list(self):
         positions = []
-        for sid, pos in self.positions.iteritems():
+        for sid, pos in iteritems(self.positions):
             if pos.amount != 0:
                 positions.append(pos.to_dict())
         return positions
